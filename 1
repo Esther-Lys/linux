@@ -1,0 +1,248 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <stdbool.h>
+#include <string.h>
+#include <signal.h>
+#include <unistd.h>
+#include <sys/wait.h>
+
+#include <readline/readline.h>
+#include <readline/history.h>
+
+// ============ DÉCLARATIONS VFS (à la place de vfs.h) ============
+void vfs_init(void);
+void vfs_check_events(void);
+void vfs_sync_user(const char *username);
+void vfs_cleanup(void);
+const char *vfs_get_path(void);
+void vfs_list_users(void);
+
+// ============ CONFIGURATION ============
+#define HISTORY_FILE ".kubsh_history"
+sig_atomic_t signal_received = 0;
+
+// ============ FONCTIONS SHELL ============
+
+void sig_handler(int signum) {
+    if (signum == SIGHUP) {
+        printf("Configuration reloaded\n");
+    }
+    signal_received = signum;
+}
+
+void debug(char *line) {
+    printf("%s\n", line);
+}
+
+void echo_command(char *input) {
+    char *text = input + 5;
+    if (text[0] == '"' && text[strlen(text)-1] == '"') {
+        text[strlen(text)-1] = '\0';
+        text++;
+    }
+    printf("%s\n", text);
+}
+
+void print_env_var(const char *var_name) {
+    if (var_name == NULL || strlen(var_name) == 0) {
+        printf("Usage: \\e $VARNAME\n");
+        return;
+    }
+    
+    if (var_name[0] == '$')
+        var_name++;
+    
+    const char *value = getenv(var_name);
+    if (value == NULL) {
+        printf("Variable'%s'not found.\n", var_name);
+        return;
+    }
+    
+    char *copy = strdup(value);
+    if (!copy) {
+        perror("strdup");
+        return;
+    }
+    
+    printf("%s =\n", var_name);
+    
+    if (strchr(copy, ':')) {
+        char *token = strtok(copy, ":");
+        while (token) {
+            printf("-%s\n", token);
+            token = strtok(NULL, ":");
+        }
+    } else {
+        printf("%s\n", copy);
+    }
+    
+    free(copy);
+}
+
+void list_partitions(const char *device) {
+    char command[512];
+    
+    if (device && strlen(device) > 0) {
+        snprintf(command, sizeof(command), 
+                 "sudo fdisk -l %s 2>/dev/null || sudo lsblk %s", 
+                 device, device);
+    } else {
+        snprintf(command, sizeof(command), "sudo lsblk");
+    }
+    
+    system(command);
+}
+
+void execute_command(char *input) {
+    char *args[64];
+    int i = 0;
+    
+    char *copy = strdup(input);
+    char *token = strtok(copy, " ");
+    
+    while (token != NULL && i < 63) {
+        args[i++] = token;
+        token = strtok(NULL, " ");
+    }
+    args[i] = NULL;
+    
+    if (args[0] == NULL) {
+        free(copy);
+        return;
+    }
+    
+    if (strcmp(args[0], "cd") == 0) {
+        if (args[1]) {
+            if (chdir(args[1]) != 0) {
+                perror("cd");
+            }
+        } else {
+            chdir(getenv("HOME"));
+        }
+        free(copy);
+        return;
+    }
+    
+    // Vérification de la commande dans PATH
+    char *path = getenv("PATH");
+    char *path_copy = strdup(path);
+    char *dir = strtok(path_copy, ":");
+    int found = 0;
+    
+    while (dir != NULL) {
+        char full_path[512];
+        snprintf(full_path, sizeof(full_path), "%s/%s", dir, args[0]);
+        
+        if (access(full_path, X_OK) == 0) {
+            found = 1;
+            break;
+        }
+        dir = strtok(NULL, ":");
+    }
+    
+    free(path_copy);
+    
+    if (!found && access(args[0], X_OK) == -1) {
+        printf("Command not found: %s\n", args[0]);
+        free(copy);
+        return;
+    }
+    
+    pid_t pid = fork();
+    if (pid == 0) {
+        execvp(args[0], args);
+        perror(args[0]);
+        exit(EXIT_FAILURE);
+    } else if (pid > 0) {
+        int status;
+        waitpid(pid, &status, 0);
+    } else {
+        perror("fork");
+    }
+    
+    free(copy);
+}
+
+// ============ MAIN ============
+
+int main() {
+    // Configuration des signaux
+    signal(SIGHUP, sig_handler);
+    signal(SIGINT, SIG_IGN);
+    
+    // Historique
+    char *home = getenv("HOME");
+    char history_path[512];
+    snprintf(history_path, sizeof(history_path), "%s/%s", home, HISTORY_FILE);
+    
+    FILE *test = fopen(history_path, "r");
+    if (test) {
+        fclose(test);
+        read_history(history_path);
+    }
+    
+    // Initialisation VFS
+    vfs_init();
+    
+    printf("Kubsh started. Type \\q to quit.\n");
+    
+    char *input;
+    
+    // Boucle principale
+    while (1) {
+        // Vérifier les événements VFS
+        vfs_check_events();
+        
+        input = readline("kubsh> ");
+        
+        if (signal_received) {
+            signal_received = 0;
+            if (input) free(input);
+            continue;
+        }
+        
+        if (input == NULL) {
+            printf("\n");
+            break;
+        }
+        
+        if (strlen(input) == 0) {
+            free(input);
+            continue;
+        }
+        
+        add_history(input);
+        
+        // Traitement des commandes
+        if (!strcmp(input, "\\q")) {
+            free(input);
+            break;
+        }
+        else if (strncmp(input, "debug ", 6) == 0) {
+            debug(input);
+        }
+        else if (strncmp(input, "echo ", 5) == 0) {
+            echo_command(input);
+        }
+        else if (strncmp(input, "\\e $", 4) == 0) {
+            print_env_var(input + 4);
+        }
+        else if (strncmp(input, "\\l", 2) == 0) {
+            char *device = input + 2;
+            while (*device == ' ') device++;
+            list_partitions(device);
+        }
+        else {
+            execute_command(input);
+        }
+        
+        free(input);
+    }
+    
+    // Sauvegarde et nettoyage
+    write_history(history_path);
+    vfs_cleanup();
+    
+    printf("Goodbye!\n");
+    return 0;
+}
