@@ -22,10 +22,11 @@ RUN apt-get update && apt-get install -y \
     fuse3 \
     && rm -rf /var/lib/apt/lists/*
 
+RUN useradd -m -s /bin/bash testuser
+RUN useradd -m -s /bin/bash admin || true
 
 COPY --from=builder /app/kubsh1 /usr/local/bin/kubsh1
 
-RUN useradd -m -s /bin/bash testuser
 
 ENV HOME=/root
 ENV USER=root
@@ -34,4 +35,5 @@ ENV PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
 WORKDIR /root
 
-CMD ["kubsh1"]
+RUN mkdir -p /users
+CMD [ "bash", "-c", "kubsh1"]
